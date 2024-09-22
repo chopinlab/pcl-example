@@ -1,0 +1,114 @@
+#include <pcl/point_types.h>
+#include <pcl/io/pcd_io.h>
+#include <pcl/point_cloud.h>
+#include <pcl/filters/voxel_grid.h>
+#include <pcl/features/normal_3d.h>
+#include <pcl/features/fpfh.h>
+#include <pcl/registration/sample_consensus_prerejective.h>
+#include <pcl/registration/transforms.h>
+#include <iostream>
+
+int main(int argc, char** argv) {
+    if (argc != 3) {
+        std::cerr << "Usage: " << argv[0] << " <full_map.pcd> <updated_map.pcd>" << std::endl;
+        return -1;
+    }
+
+    std::string full_map_file = argv[1];
+    std::string updated_map_file = argv[2];
+
+    // 두 개의 PCD 파일 로드
+    pcl::PointCloud<pcl::PointXYZ>::Ptr full_map(new pcl::PointCloud<pcl::PointXYZ>);
+    pcl::PointCloud<pcl::PointXYZ>::Ptr updated_map(new pcl::PointCloud<pcl::PointXYZ>);
+
+    if (pcl::io::loadPCDFile<pcl::PointXYZ>(full_map_file, *full_map) == -1) {
+        PCL_ERROR("Couldn't read file %s\n", full_map_file.c_str());
+        return -1;
+    }
+    if (pcl::io::loadPCDFile<pcl::PointXYZ>(updated_map_file, *updated_map) == -1) {
+        PCL_ERROR("Couldn't read file %s\n", updated_map_file.c_str());
+        return -1;
+    }
+
+    std::cout << "Loaded full map: " << full_map->width * full_map->height << " points." << std::endl;
+    std::cout << "Loaded updated map: " << updated_map->width * updated_map->height << " points." << std::endl;
+
+    // Voxel Grid 필터로 다운샘플링 (각 점군을 간소화)
+    pcl::VoxelGrid<pcl::PointXYZ> voxel_filter;
+    pcl::PointCloud<pcl::PointXYZ>::Ptr full_map_downsampled(new pcl::PointCloud<pcl::PointXYZ>);
+    pcl::PointCloud<pcl::PointXYZ>::Ptr updated_map_downsampled(new pcl::PointCloud<pcl::PointXYZ>);
+
+    // 다운샘플링 해상도 설정 (예: 10cm)
+    float leaf_size = 0.3f;  // 10cm로 설정
+    voxel_filter.setLeafSize(leaf_size, leaf_size, leaf_size);
+
+    // full_map 다운샘플링
+    voxel_filter.setInputCloud(full_map);
+    voxel_filter.filter(*full_map_downsampled);
+    std::cout << "Downsampled full map to: " << full_map_downsampled->width * full_map_downsampled->height << " points." << std::endl;
+
+    // updated_map 다운샘플링
+    voxel_filter.setInputCloud(updated_map);
+    voxel_filter.filter(*updated_map_downsampled);
+    std::cout << "Downsampled updated map to: " << updated_map_downsampled->width * updated_map_downsampled->height << " points." << std::endl;
+
+    // Normals 추출
+    pcl::PointCloud<pcl::Normal>::Ptr full_map_normals(new pcl::PointCloud<pcl::Normal>);
+    pcl::PointCloud<pcl::Normal>::Ptr updated_map_normals(new pcl::PointCloud<pcl::Normal>);
+    pcl::NormalEstimation<pcl::PointXYZ, pcl::Normal> normal_estimation;
+    pcl::search::KdTree<pcl::PointXYZ>::Ptr tree(new pcl::search::KdTree<pcl::PointXYZ>);
+    normal_estimation.setSearchMethod(tree);
+    normal_estimation.setRadiusSearch(0.1);
+
+    normal_estimation.setInputCloud(full_map_downsampled);
+    normal_estimation.compute(*full_map_normals);
+
+    normal_estimation.setInputCloud(updated_map_downsampled);
+    normal_estimation.compute(*updated_map_normals);
+
+    // FPFH (Fast Point Feature Histogram) 계산
+    pcl::PointCloud<pcl::FPFHSignature33>::Ptr full_map_fpfh(new pcl::PointCloud<pcl::FPFHSignature33>);
+    pcl::PointCloud<pcl::FPFHSignature33>::Ptr updated_map_fpfh(new pcl::PointCloud<pcl::FPFHSignature33>);
+    pcl::FPFHEstimation<pcl::PointXYZ, pcl::Normal, pcl::FPFHSignature33> fpfh_estimation;
+    fpfh_estimation.setRadiusSearch(0.2);
+
+    fpfh_estimation.setInputCloud(full_map_downsampled);
+    fpfh_estimation.setInputNormals(full_map_normals);
+    fpfh_estimation.compute(*full_map_fpfh);
+
+    fpfh_estimation.setInputCloud(updated_map_downsampled);
+    fpfh_estimation.setInputNormals(updated_map_normals);
+    fpfh_estimation.compute(*updated_map_fpfh);
+
+    // SAC-IA (Sample Consensus Initial Alignment) 설정
+    pcl::SampleConsensusPrerejective<pcl::PointXYZ, pcl::PointXYZ, pcl::FPFHSignature33> sac_ia;
+    sac_ia.setInputSource(updated_map_downsampled);
+    sac_ia.setSourceFeatures(updated_map_fpfh);
+    sac_ia.setInputTarget(full_map_downsampled);
+    sac_ia.setTargetFeatures(full_map_fpfh);
+    sac_ia.setMaximumIterations(5000);       // 최대 반복 횟수
+    sac_ia.setNumberOfSamples(3);             // 샘플링 포인트 수
+    sac_ia.setCorrespondenceRandomness(5);    // Correspondence randomness
+    sac_ia.setSimilarityThreshold(0.9);       // 유사성 임계값
+    sac_ia.setMaxCorrespondenceDistance(2.5); // Correspondence 거리
+    sac_ia.setInlierFraction(0.25);           // Inlier 비율
+
+    pcl::PointCloud<pcl::PointXYZ>::Ptr aligned_map(new pcl::PointCloud<pcl::PointXYZ>);
+    sac_ia.align(*aligned_map);
+
+    if (!sac_ia.hasConverged()) {
+        std::cerr << "SAC-IA did not converge." << std::endl;
+        return -1;
+    }
+
+    std::cout << "SAC-IA converged with score: " << sac_ia.getFitnessScore() << std::endl;
+
+    // 두 점군을 병합
+    *full_map_downsampled += *aligned_map;
+
+    // 병합된 결과를 저장
+    pcl::io::savePCDFileASCII("merged_map.pcd", *full_map_downsampled);
+    std::cout << "Saved merged map as merged_map.pcd" << std::endl;
+
+    return 0;
+}

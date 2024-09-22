@@ -1,0 +1,76 @@
+#include <pcl/point_types.h>
+#include <pcl/io/pcd_io.h>
+#include <pcl/point_cloud.h>
+#include <pcl/registration/icp.h>
+#include <pcl/kdtree/kdtree_flann.h>
+#include <iostream>
+
+int main(int argc, char** argv) {
+    if (argc != 3) {
+        std::cerr << "Usage: " << argv[0] << " <full_map.pcd> <updated_map.pcd>" << std::endl;
+        return -1;
+    }
+
+    std::string full_map_file = argv[1];
+    std::string updated_map_file = argv[2];
+
+    // 두 개의 PCD 파일 로드
+    pcl::PointCloud<pcl::PointXYZ>::Ptr full_map(new pcl::PointCloud<pcl::PointXYZ>);
+    pcl::PointCloud<pcl::PointXYZ>::Ptr updated_map(new pcl::PointCloud<pcl::PointXYZ>);
+
+    if (pcl::io::loadPCDFile<pcl::PointXYZ>(full_map_file, *full_map) == -1) {
+        PCL_ERROR("Couldn't read file %s\n", full_map_file.c_str());
+        return -1;
+    }
+    if (pcl::io::loadPCDFile<pcl::PointXYZ>(updated_map_file, *updated_map) == -1) {
+        PCL_ERROR("Couldn't read file %s\n", updated_map_file.c_str());
+        return -1;
+    }
+
+    std::cout << "Loaded full map: " << full_map->width * full_map->height << " points." << std::endl;
+    std::cout << "Loaded updated map: " << updated_map->width * updated_map->height << " points." << std::endl;
+
+    // ICP 객체 생성 및 설정
+    pcl::IterativeClosestPoint<pcl::PointXYZ, pcl::PointXYZ> icp;
+    icp.setInputSource(updated_map);  // 업데이트된 지도를 소스(변환될 점군)로 설정
+    icp.setInputTarget(full_map);     // 전체 지도를 타겟(기준점군)으로 설정
+
+    // 정렬 후 결과 저장할 객체
+    pcl::PointCloud<pcl::PointXYZ> aligned_map;
+
+    // ICP 실행
+    icp.align(aligned_map);
+
+    if (!icp.hasConverged()) {
+        std::cerr << "ICP did not converge." << std::endl;
+        return -1;
+    }
+
+    std::cout << "ICP converged with score: " << icp.getFitnessScore() << std::endl;
+
+    // KDTree를 사용하여 full_map 내에서 가까운 점을 찾기 위한 KDTree 설정
+    pcl::KdTreeFLANN<pcl::PointXYZ> kdtree;
+    kdtree.setInputCloud(full_map);
+
+    // 업데이트된 PCD 파일을 full_map에 삽입 (기존 데이터를 업데이트된 데이터로 교체)
+    for (const auto& point : aligned_map.points) {
+        std::vector<int> nearest_indices(1);  // 가장 가까운 점의 인덱스를 저장할 벡터
+        std::vector<float> nearest_distances(1);  // 가장 가까운 점과의 거리 저장
+
+        // kdtree를 사용하여 해당 포인트의 가장 가까운 이웃 찾기
+        if (kdtree.nearestKSearch(point, 1, nearest_indices, nearest_distances) > 0) {
+            int nearest_index = nearest_indices[0];
+
+            // 특정 임계값을 사용하여 일정 거리 내에 있는 경우만 교체 (예: 0.05m)
+            if (nearest_distances[0] < 0.05) {
+                full_map->points[nearest_index] = point;  // 기존의 점을 업데이트된 점으로 교체
+            }
+        }
+    }
+
+    // 업데이트된 full_map을 저장
+    pcl::io::savePCDFileASCII("merged_map.pcd", *full_map);
+    std::cout << "Saved merged map as merged_map.pcd" << std::endl;
+
+    return 0;
+}

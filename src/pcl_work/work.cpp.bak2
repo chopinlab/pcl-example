@@ -1,0 +1,162 @@
+#include <pcl/point_types.h>
+#include <pcl/io/pcd_io.h>
+#include <pcl/filters/crop_box.h>
+#include <iostream>
+#include <vector>
+#include <map>
+#include <Eigen/Dense>
+#include <cmath>
+
+// 그리드 구간 크기를 정의
+const double grid_size = 0.001;  // 각 구간의 크기 (0.01 x 0.01)
+
+// 평면 방정식을 구하는 함수 (3개의 점을 통해 평면 방정식 유도)
+Eigen::Vector3d calculatePlaneFromPoints(const Eigen::Vector3d& p1, const Eigen::Vector3d& p2, const Eigen::Vector3d& p3) {
+    Eigen::Vector3d v1 = p2 - p1;
+    Eigen::Vector3d v2 = p3 - p1;
+    Eigen::Vector3d normal = v1.cross(v2);  // 외적을 이용해 법선 벡터 계산
+    normal.normalize();  // 단위 벡터로 정규화
+    return normal;
+}
+
+// 평면 방정식을 바탕으로 z 값을 계산하는 함수
+double targetZ(double x, double y, const Eigen::Vector3d& normal, const Eigen::Vector3d& p1) {
+    // 평면 방정식: n_x * (x - x1) + n_y * (y - y1) + n_z * (z - z1) = 0 을 통해 z 계산
+    return (normal[0] * (p1[0] - x) + normal[1] * (p1[1] - y)) / normal[2] + p1[2];
+}
+
+// 5개의 평면을 고려한 부피 계산 함수 (보간법 제외)
+double calculateVolumeWith5Planes(const pcl::PointCloud<pcl::PointXYZ>::Ptr &cloud,
+                                  const Eigen::Vector3d& normal_bottom, const Eigen::Vector3d& p_target1,
+                                  const std::vector<Eigen::Vector2d>& boundary_area,
+                                  const std::vector<Eigen::Vector3d>& original_points,
+                                  const std::vector<Eigen::Vector3d>& target_points) {
+    std::map<std::pair<int, int>, std::vector<double>> grid_map;
+
+    // 각 점을 그리드로 나눠서 z값을 저장
+    for (const auto& point : cloud->points) {
+        int grid_x = static_cast<int>(std::floor(point.x / grid_size));
+        int grid_y = static_cast<int>(std::floor(point.y / grid_size));
+        grid_map[{grid_x, grid_y}].push_back(point.z);
+    }
+
+    // 평균 z 값을 저장할 맵
+    std::map<std::pair<int, int>, double> grid_avg_z;
+
+    // 각 그리드 구간에 대해 평균 z값을 계산
+    for (const auto& kv : grid_map) {
+        const std::vector<double>& z_values = kv.second;
+        double z_sum = 0.0;
+        for (double z : z_values) {
+            z_sum += z;
+        }
+        double avg_z = z_sum / z_values.size();  // 해당 구간의 평균 z값
+        grid_avg_z[kv.first] = avg_z;
+    }
+
+    double total_volume = 0.0;
+
+    // 바닥 평면 부피 계산
+    for (int i = boundary_area[0][0]; i <= boundary_area[1][0]; ++i) {  // x 방향 그리드 범위
+        for (int j = boundary_area[0][1]; j <= boundary_area[2][1]; ++j) {  // y 방향 그리드 범위
+            std::pair<int, int> grid_idx = {i, j};
+
+            double avg_z = 0.0;
+            if (grid_avg_z.find(grid_idx) != grid_avg_z.end()) {
+                // 그리드에 데이터가 있는 경우
+                avg_z = grid_avg_z[grid_idx];
+            }
+
+            // 타겟 영역의 바닥 평면에 따른 z 값 계산
+            double target_z = targetZ(i * grid_size, j * grid_size, normal_bottom, p_target1);
+
+            // 평균 z값과 타겟 z값의 차이로 부피 계산
+            double z_diff = avg_z - target_z;
+            if (z_diff > 0) {  // 타겟 z값보다 높은 경우에만 부피를 계산
+                double grid_area = grid_size * grid_size;  // 각 구간의 면적
+                double volume = grid_area * z_diff;  // 부피 = 면적 * 높이(z_diff)
+                total_volume += volume;
+            }
+        }
+    }
+
+    // 4개의 옆면 부피 계산
+    for (int side = 0; side < 4; ++side) {
+        // 각 옆면의 2개의 원래 영역의 점과 2개의 타겟 영역의 점을 사용해 평면 계산
+        Eigen::Vector3d normal_side = calculatePlaneFromPoints(original_points[side], original_points[(side + 1) % 4], target_points[side]);
+        
+        for (int i = boundary_area[side][0]; i <= boundary_area[(side + 1) % 4][0]; ++i) {
+            for (int j = boundary_area[side][1]; j <= boundary_area[(side + 1) % 4][1]; ++j) {
+                std::pair<int, int> grid_idx = {i, j};
+
+                double avg_z = 0.0;
+                if (grid_avg_z.find(grid_idx) != grid_avg_z.end()) {
+                    avg_z = grid_avg_z[grid_idx];
+                }
+
+                double target_z_side = targetZ(i * grid_size, j * grid_size, normal_side, original_points[side]);
+
+                // 옆면 부피 계산
+                double z_diff_side = avg_z - target_z_side;
+                if (z_diff_side > 0) {
+                    double grid_area = grid_size * grid_size;
+                    double volume_side = grid_area * z_diff_side;
+                    total_volume += volume_side;
+                }
+            }
+        }
+    }
+
+    return total_volume;
+}
+
+int main(int argc, char** argv) {
+    // PCD 파일을 로드
+    if (argc < 2) {
+        std::cerr << "사용법: " << argv[0] << " <pcd 파일 경로>" << std::endl;
+        return (-1);
+    }
+
+    std::string pcd_file = argv[1];
+
+    pcl::PointCloud<pcl::PointXYZ>::Ptr cloud(new pcl::PointCloud<pcl::PointXYZ>());
+    if (pcl::io::loadPCDFile<pcl::PointXYZ>(pcd_file, *cloud) == -1) {
+        PCL_ERROR("파일을 로드할 수 없습니다: %s \n", pcd_file.c_str());
+        return (-1);
+    }
+
+    // 원래 영역의 4개의 점 (x11, y11), (x12, y12), (x13, y13), (x14, y14)
+    std::vector<Eigen::Vector3d> original_points = {
+    Eigen::Vector3d(-0.4, 0.4, 0),   // 첫 번째 점
+    Eigen::Vector3d(-0.2, 0.4, 0),    // 두 번째 점
+    Eigen::Vector3d(-0.2, 0.2, 0),     // 세 번째 점
+    Eigen::Vector3d(-0.4, 0.2, 0)     // 네 번째 점
+};
+
+// 타겟 영역의 4개의 점 (시계 방향)
+std::vector<Eigen::Vector3d> target_points = {
+    Eigen::Vector3d(-0.3, 0.3, -1),  // 첫 번째 점
+    Eigen::Vector3d(-0.1, 0.3, -1),   // 두 번째 점
+    Eigen::Vector3d(-0.1, 0.1, -1),    // 세 번째 점
+    Eigen::Vector3d(-0.3, 0.1, -1)    // 네 번째 점
+};
+
+    // 바닥 평면의 법선 벡터 계산 (타겟 영역의 3개의 점을 사용)
+    Eigen::Vector3d normal_bottom = calculatePlaneFromPoints(target_points[0], target_points[1], target_points[2]);
+
+    // 영역의 경계 설정 (x, y 좌표만 사용)
+    std::vector<Eigen::Vector2d> boundary_area = {
+        Eigen::Vector2d(-0.4, 0.4),   // 원래 영역 첫 번째 경계
+        Eigen::Vector2d(-0.2, 0.4),  // 원래 영역 두 번째 경계
+        Eigen::Vector2d(-0.2, 0.2),  // 원래 영역 세 번째 경계
+        Eigen::Vector2d(-0.4, 0.2)  // 원래 영역 네 번째 경계
+    };
+
+    // 부피 계산
+    double volume = calculateVolumeWith5Planes(cloud, normal_bottom, target_points[0], boundary_area, original_points, target_points);
+
+    // 결과 출력
+    std::cout << "계산된 부피: " << volume << " 단위^3" << std::endl;
+
+    return 0;
+}
